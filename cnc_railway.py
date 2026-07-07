@@ -503,10 +503,10 @@ def route_http(method, path, headers, body):
     if method == 'GET' and (path == '/' or path == '/login' or path == '/index.html'):
         user = check_auth(headers)
         if user:
-            return build_dashboard_page(user).encode()
+            return http_response(HTTP_200, "text/html; charset=utf-8", build_dashboard_page(user))
         else:
             error = 'error' in path or 'error=1' in path
-            return build_login_page(error).encode()
+            return http_response(HTTP_200, "text/html; charset=utf-8", build_login_page(error))
 
     # ——— POST: login ———
     if method == 'POST' and path == '/login':
