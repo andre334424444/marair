@@ -21,9 +21,6 @@ ENV DB_PATH=/data/mirai.db
 ENV ADMIN_USER=root
 ENV ADMIN_PASS=mirai
 
-# data volume mount point
-VOLUME ["/data"]
-
 USER mirai
 WORKDIR /home/mirai
 
