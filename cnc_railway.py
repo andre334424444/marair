@@ -37,8 +37,20 @@ ADMIN_PASS   = os.environ.get('ADMIN_PASS', 'mirai')
 BOT_TIMEOUT  = 120
 BUFFER_SIZE  = 4096
 
-# ensure /data exists for Railway volume
-os.makedirs('/data', exist_ok=True)
+# ensure DB directory exists and is writable
+db_dir = os.path.dirname(DB_PATH) or '/data'
+try:
+    os.makedirs(db_dir, exist_ok=True)
+    # test write
+    testfile = os.path.join(db_dir, '.write_test')
+    with open(testfile, 'w') as f:
+        f.write('ok')
+    os.remove(testfile)
+except (OSError, PermissionError):
+    # volume not writable — fall back to home dir
+    DB_PATH = '/home/mirai/mirai.db'
+    os.makedirs('/home/mirai', exist_ok=True)
+    print(f"[!] /data not writable, falling back to {DB_PATH}")
 
 # ——— database ——————————————————————————————————————————————————————
 db = sqlite3.connect(DB_PATH, check_same_thread=False)
