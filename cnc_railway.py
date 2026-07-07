@@ -23,7 +23,10 @@ import urllib.parse
 from collections import defaultdict
 
 # ——— config ——————————————————————————————————————————————————————
-PORT         = int(os.environ.get('PORT', 8080))
+# Railway sets RAILWAY_TCP_APPLICATION_PORT for TCP services, PORT for HTTP
+# Try PORT first (Railway HTTP), then TCP_APPLICATION_PORT, fallback 8080
+_raw_port = os.environ.get('PORT') or os.environ.get('RAILWAY_TCP_APPLICATION_PORT') or '8080'
+PORT = int(_raw_port)
 DB_PATH      = os.environ.get('DB_PATH', '/data/mirai.db')
 ADMIN_USER   = os.environ.get('ADMIN_USER', 'root')
 ADMIN_PASS   = os.environ.get('ADMIN_PASS', 'mirai')
