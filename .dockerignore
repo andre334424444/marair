@@ -1,0 +1,3 @@
+# skip everything except the railway CNC
+*
+!cnc_railway.py
