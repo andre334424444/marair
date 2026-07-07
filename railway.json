@@ -12,7 +12,7 @@
   "service": {
     "name": "eni-cnc",
     "port": 8080,
-    "protocol": "tcp",
+    "protocol": "http",
     "volumes": [
       {
         "name": "eni-data",
